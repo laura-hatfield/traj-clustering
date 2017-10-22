@@ -1,0 +1,200 @@
+---
+title: "Clustering trajectories"
+author: "Hatfield, Heggeseth, Schuler"
+date: "October 20, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = FALSE,
+	message = FALSE,
+	warning = FALSE,
+	fig.width = 10
+)
+library(biclust) # loads MASS, which has select that will mask in dplyr
+library(ggplot2)
+library(gridExtra) # masks combine
+library(dplyr)
+library(tidyr) 
+library(readr)
+library(directlabels)
+library(knitr)
+library(igraph) # masks distances
+library(distances)
+library(cluster)
+library(mclust)
+
+load("synthetic_ESSCLC_data.RData")
+theme_set(theme_minimal())
+max.days <- 365
+
+## Function to make the plots
+## takes sorted trajectory data
+plot.sorted.trajectories <- function(traj.dat){
+  ## Only plot 1 thru 100
+  plot.scaled.traj <- ggplot(filter(traj.dat,ID%in%1:100),
+                             aes(y=ID,yend=ID,x=FromDateRel,xend=ThruDateRel,group=ID)) +
+  geom_segment(aes(col=setting),size=3) +
+  xlab("Proportion") + ylab("") +
+  scale_color_brewer(type="qual",palette=3,guide="none")+
+  theme(legend.position="bottom",legend.title=element_blank(),panel.grid=element_blank(),axis.text.x=element_text(angle=90)) + coord_flip()
+plot.traj <- ggplot(filter(traj.dat,ID%in%1:100),
+                    aes(y=ID,yend=ID,x=FromDate,xend=ThruDate,group=ID)) +
+  geom_segment(aes(col=setting),size=3) +
+  scale_x_continuous("Days",limits=c(0,max.days)) + ylab("") +
+  scale_color_brewer(type="qual",palette=3,guide="none")+
+  theme(legend.position="bottom",legend.title=element_blank(),panel.grid=element_blank(),axis.text.x=element_text(angle=90)) + coord_flip()
+grid.arrange(plot.scaled.traj,plot.traj)
+}
+
+## Function to make class-specific group time trajectories
+## takes trajectory data object with cluster variable
+plot.cluster.means <- function(traj.dat){
+  cluster.labels <- select(traj.dat,ID,cluster) %>% group_by(ID) %>% slice(1) %>% 
+    group_by(cluster) %>% summarize(count=n()) %>% ungroup() %>% 
+    mutate(total=sum(count),prop=count/total*100,
+           label=paste("Cluster ",cluster," (",round(prop,0),"%)",sep=""))
+  resolution <- .1
+  class.segment.dat <- traj.dat %>%
+    select(cluster,setting,FromDateRel,ThruDateRel) %>%
+    ## Segments are in increments of .05 of relative length:
+    mutate(segment.min=round(FromDateRel / resolution,0),
+           segment.max=round(ThruDateRel / resolution,0))
+  class.summaries <- NULL
+  for(i in 1:(1/resolution)) {
+    these <- filter(class.segment.dat,i>=segment.min,i<=segment.max)
+    temp <- left_join(these %>% group_by(cluster) %>% summarize(denom=n()),
+                      these %>% group_by(cluster,setting) %>%
+                        summarize(num=n()),by="cluster") %>%
+      spread(key=setting,value=num) %>% 
+      mutate_each(funs(ifelse(is.na(.),0,.)),-cluster,-denom) %>%
+      gather(key=setting,value=num,-cluster,-denom) %>%
+      mutate(prop=num/denom*100,segment=i) %>% arrange(cluster,setting)
+
+    class.summaries <- bind_rows(class.summaries,temp) %>%
+      mutate(cluster.label=factor(cluster,levels=cluster.labels$cluster,
+                                  labels=cluster.labels$label))
+    rm(these,temp)
+  }
+  ## Add zeros to empty segments (for small classes, especially)
+
+  ggplot(class.summaries,aes(x=segment,y=prop,group=setting)) + 
+    geom_smooth(aes(col=setting),se=F,method="loess") + facet_wrap(~cluster.label) +
+    scale_color_brewer(palette="Dark2",guide="none") +
+    theme(strip.background=element_blank(),panel.grid=element_blank(),
+          axis.text=element_blank()) +
+    scale_y_continuous("",limits=c(0,100)) + 
+    scale_x_continuous("",expand=c(0,1.1))  +
+    geom_dl(aes(label=setting,col=setting),method=list("top.bumpup",cex=.8,hjust=.5))
+}
+```
+
+## Sorted on true class and then ID (i.e., arbitrary within class)
+```{r plot_trajectories}
+## Subset to a small number of people
+these.episodes <- filter(episodes,ID%in%1:200) %>% ungroup() %>%
+  left_join(summary.stats %>% select(ID,class),by="ID")
+first.ep <- these.episodes %>% group_by(ID,setting) %>% slice(1) %>%
+  select(ID,setting,FromDateRel) %>%
+  spread(key=setting,value=FromDateRel) %>%
+  rename(first.Hospice=Hospice,first.Hospital=Hospital,
+         first.NoCoveredCare=NoCoveredCare,
+         first.SNF=SNF) %>% ungroup()
+these.sumstats <- filter(summary.stats,ID%in%1:200) %>% ungroup() %>%
+  left_join(first.ep,by="ID") %>%
+  mutate_each(funs(ifelse(is.na(.),0,.)),first.Hospice:first.SNF)
+
+## Plot the new trajectories first 100 records (used subsequently)
+true.traj.dat <- these.episodes %>%
+  mutate(ID=factor(ID,levels=order(summary.stats$class,summary.stats$ID)),
+         cluster=class)
+
+plot.sorted.trajectories(true.traj.dat)
+plot.cluster.means(true.traj.dat)
+```
+
+## Divisive clustering on Gower's distance measure from original summary stats (standardized)
+```{r orig_summaries}
+orig.dmat <- daisy(these.sumstats %>%
+                     select(perc.Hospice:SNF.Count),
+                   metric="gower",stand=T)
+orig.clusts <- diana(orig.dmat)
+
+## Look at the trajectories in order of agglomerative clustering:
+## Join back to the data and plot
+orig.traj.dat <- these.episodes %>%
+  left_join(data.frame(ID=these.sumstats$ID,
+                          cluster=cutree(as.hclust(orig.clusts),h=.35)),by="ID") %>%
+  mutate(ID=factor(ID,levels=orig.clusts$order,ordered=T))
+
+plot.sorted.trajectories(orig.traj.dat)
+
+## Cut them into classes and plot the average trajectories by class:
+pltree(orig.clusts,main="",xlab="",sub="");abline(h=.35,lty=2)
+plot.cluster.means(orig.traj.dat)
+```
+
+## Divisive clustering on Gower's distance measure from original summary stats plus survival time (standardized)
+```{r orig_plus_surv}
+surv.dmat <- daisy(these.sumstats %>%
+                     select(perc.Hospice:SNF.Count,Survival.Days),
+                   metric="gower",stand=T)
+surv.clusts <- diana(surv.dmat)
+
+## Look at the trajectories in order of agglomerative clustering:
+## Join back to the data and plot
+surv.traj.dat <- these.episodes %>%
+  left_join(data.frame(ID=these.sumstats$ID,
+                          cluster=cutree(as.hclust(surv.clusts),h=.35)),by="ID") %>%
+  mutate(ID=factor(ID,levels=surv.clusts$order,ordered=T))
+
+## Cut them into classes and plot the average trajectories by class:
+pltree(surv.clusts,main="",xlab="",sub="");abline(h=.35,lty=2)
+plot.cluster.means(surv.traj.dat)
+```
+
+## Divisive clustering on Gower's distance measure from original summary stats plus survival time and relative timing of first episode in each setting (standardized)
+```{r orig_plus_timing}
+timing.dmat <- daisy(these.sumstats %>%
+                    select(perc.Hospice:SNF.Count,Survival.Days,
+                           first.Hospice:first.SNF),
+                    metric="gower",stand=T)
+timing.clusts <- diana(timing.dmat)
+
+## Look at the trajectories in order of agglomerative clustering:
+## Join back to the data and plot
+timing.traj.dat <- these.episodes %>%
+    left_join(data.frame(ID=these.sumstats$ID,
+                          cluster=cutree(as.hclust(timing.clusts),h=.35)),by="ID") %>%
+  mutate(ID=factor(ID,levels=timing.clusts$order,ordered=T))
+
+plot.sorted.trajectories(timing.traj.dat)
+
+## Cut them into classes and plot the average trajectories by class:
+pltree(timing.clusts,main="",sub="",xlab="");abline(h=.35,lty=2)
+plot.cluster.means(timing.traj.dat)
+```
+
+## Divisive clustering on Gower's distance measure from original summary stats plus survival time and relative timing of first episode in each setting and site of death (standardized)
+```{r orig_plus_death}
+death.dmat <- daisy(these.sumstats %>%
+                    select(perc.Hospice:SNF.Count,Survival.Days,
+                           first.Hospice:first.SNF,site.death),
+                    metric="gower",stand=T)
+death.clusts <- diana(death.dmat)
+
+## Look at the trajectories in order of agglomerative clustering:
+## Join back to the data and plot
+death.traj.dat <- these.episodes %>%
+  left_join(data.frame(ID=these.sumstats$ID,
+                       cluster=cutree(as.hclust(death.clusts),h=.35)),by="ID") %>%
+  mutate(ID=factor(ID,levels=death.clusts$order,ordered=T))
+
+plot.sorted.trajectories(death.traj.dat)
+
+## Cut them into classes and plot the average trajectories by class:
+pltree(death.clusts,main="",sub="",xlab="");abline(h=.35,lty=2)
+plot.cluster.means(death.traj.dat)
+```
+
